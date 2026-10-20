@@ -176,6 +176,7 @@ impl ColumnType {
         let is_binary = flags.contains(ColumnFlags::BINARY);
         let is_unsigned = flags.contains(ColumnFlags::UNSIGNED);
         let is_enum = flags.contains(ColumnFlags::ENUM);
+        let is_set = flags.contains(ColumnFlags::SET);
 
         match self {
             ColumnType::Tiny if max_size == Some(1) => "BOOLEAN",
@@ -205,8 +206,9 @@ impl ColumnType {
             ColumnType::Json => "JSON",
             ColumnType::Vector => "VECTOR",
 
-            ColumnType::String if is_binary => "BINARY",
             ColumnType::String if is_enum => "ENUM",
+            ColumnType::String if is_set => "SET",
+            ColumnType::String if is_binary => "BINARY",
             ColumnType::VarChar | ColumnType::VarString if is_binary => "VARBINARY",
 
             ColumnType::String => "CHAR",
@@ -271,6 +273,28 @@ impl ColumnType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enum_and_set_names_are_stable_across_collations() {
+        // MySQL sends ENUM/SET columns as type String + ENUM/SET flag; a binary
+        // collation additionally sets the BINARY flag. The decoded type name
+        // must still be ENUM/SET (#4453), since downstream type-info and decode
+        // checks key off this name.
+        assert_eq!(ColumnType::String.name(ColumnFlags::ENUM, None), "ENUM");
+        assert_eq!(
+            ColumnType::String.name(ColumnFlags::ENUM | ColumnFlags::BINARY, None),
+            "ENUM"
+        );
+        assert_eq!(ColumnType::String.name(ColumnFlags::SET, None), "SET");
+        assert_eq!(
+            ColumnType::String.name(ColumnFlags::SET | ColumnFlags::BINARY, None),
+            "SET"
+        );
+
+        // Sanity: ordinary CHAR/VARCHAR naming must not change.
+        assert_eq!(ColumnType::String.name(ColumnFlags::empty(), None), "CHAR");
+        assert_eq!(ColumnType::String.name(ColumnFlags::BINARY, None), "BINARY");
+    }
 
     #[test]
     fn decodes_a_mysql_9_vector_column() {
