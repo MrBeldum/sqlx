@@ -270,6 +270,10 @@ where
                 let mut done = false;
                 let mut in_quotes = false;
                 let mut in_escape = false;
+                // Whether the current element was quoted. Per the Postgres text-array
+                // format, only an *unquoted* NULL is SQL NULL; a quoted "NULL" is the
+                // literal string. See https://github.com/transact-rs/sqlx/issues/4452
+                let mut was_quoted = false;
                 let mut value = String::with_capacity(10);
                 let mut chars = s.chars();
                 let mut elements = Vec::with_capacity(4);
@@ -285,6 +289,7 @@ where
 
                                 '"' => {
                                     in_quotes = !in_quotes;
+                                    was_quoted = true;
                                 }
 
                                 '\\' => {
@@ -307,7 +312,7 @@ where
                         }
                     }
 
-                    let value_opt = if value == "NULL" {
+                    let value_opt = if value == "NULL" && !was_quoted {
                         None
                     } else {
                         Some(value.as_bytes())
@@ -321,10 +326,40 @@ where
                     })?);
 
                     value.clear();
+                    was_quoted = false;
                 }
 
                 Ok(elements)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression test for https://github.com/transact-rs/sqlx/issues/4452
+    //
+    // In Postgres text-array format, an *unquoted* NULL element is SQL NULL,
+    // but a *quoted* "NULL" element is the literal four-character string "NULL".
+    // The decoder must not conflate the two.
+    #[test]
+    fn test_decode_text_array_quoted_null_element_is_string_not_sql_null() {
+        let raw = b"{\"NULL\",NULL,\"foo\"}";
+
+        let decoded: Vec<Option<String>> = Decode::decode(PgValueRef {
+            value: Some(raw.as_slice()),
+            row: None,
+            type_info: <Vec<Option<String>> as Type<Postgres>>::type_info(),
+            format: PgValueFormat::Text,
+        })
+        .expect("text array decode should succeed");
+
+        assert_eq!(
+            decoded,
+            vec![Some("NULL".to_string()), None, Some("foo".to_string())],
+            "quoted \"NULL\" must decode as the string \"NULL\", unquoted NULL as SQL NULL"
+        );
     }
 }
