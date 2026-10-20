@@ -22,6 +22,13 @@ pub trait TransactionManager {
     ///
     /// If we are already inside a transaction and `statement.is_some()`, then
     /// `Error::InvalidSavePoint` is returned without running any statements.
+    ///
+    /// If this call fails or is cancelled, it must leave the connection as it
+    /// found it: any partial work (a half-issued `BEGIN` or `SAVEPOINT`) has to be
+    /// cleaned up by the implementation itself. `Transaction` does *not* issue a
+    /// defensive rollback when `begin` fails, because at a nonzero transaction
+    /// depth that rollback would unwind the caller's enclosing transaction
+    /// instead (transact-rs/sqlx#4445).
     fn begin(
         conn: &mut <Self::Database as Database>::Connection,
         statement: Option<SqlStr>,
@@ -106,11 +113,23 @@ where
             let mut tx = Self {
                 connection: conn,
 
-                // If the call to `begin` fails or doesn't complete we want to attempt a rollback in case the transaction was started.
-                open: true,
+                // Do NOT arm the drop guard until `begin` succeeds. If
+                // `TransactionManager::begin` fails or is cancelled, every
+                // in-tree driver already cleans up its own partial work, and an
+                // extra `start_rollback` from `Drop` would run at the caller's
+                // depth, rolling back the *enclosing* transaction instead of the
+                // failed nested level (transact-rs/sqlx#4445). At depth 0 the
+                // removed call was a no-op anyway.
+                open: false,
             };
 
             DB::TransactionManager::begin(&mut tx.connection, statement).await?;
+
+            // `begin` succeeded: the transaction (or savepoint) is now ours to
+            // commit or roll back, so arm the drop guard. There is no `.await`
+            // between the success and this assignment, so cancellation cannot
+            // slip in here and leave the transaction unguarded.
+            tx.open = true;
 
             Ok(tx)
         })

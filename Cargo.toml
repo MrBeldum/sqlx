@@ -326,6 +326,11 @@ path = "tests/sqlite/describe.rs"
 required-features = ["sqlite"]
 
 [[test]]
+name = "sqlite-nested-begin"
+path = "tests/sqlite/nested_begin.rs"
+required-features = ["sqlite", "runtime-tokio"]
+
+[[test]]
 name = "sqlite-macros"
 path = "tests/sqlite/macros.rs"
 required-features = ["_sqlite", "macros"]
