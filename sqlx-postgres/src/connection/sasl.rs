@@ -17,6 +17,12 @@ const USERNAME_ATTR: &str = "n";
 const CLIENT_PROOF_ATTR: &str = "p";
 const NONCE_ATTR: &str = "r";
 
+// Maximum SCRAM iteration count accepted from the server, matching
+// `postgres-protocol` 0.6.12's `MAX_ITERATION_COUNT`. A malicious or
+// compromised server can otherwise force unbounded PBKDF2 work with a huge
+// `i=` value, keeping the client busy for a very long time.
+const MAX_SCRAM_ITERATION_COUNT: u32 = 100_000;
+
 pub(crate) async fn authenticate(
     stream: &mut PgStream,
     options: &PgConnectOptions,
@@ -65,7 +71,8 @@ pub(crate) async fn authenticate(
     };
 
     // nonce = "r=" c-nonce [s-nonce] ;; Second part provided by server.
-    let nonce = gen_nonce();
+    let client_nonce = gen_nonce();
+    let nonce = format!("{NONCE_ATTR}={client_nonce}");
 
     // client-first-message-bare = [reserved-mext ","] username "," nonce ["," extensions]
     let client_first_message_bare = format!("{username},{nonce}");
@@ -89,6 +96,9 @@ pub(crate) async fn authenticate(
             ));
         }
     };
+
+    // Validate the server-first message before spending any PBKDF2 work.
+    validate_server_first_message(&client_nonce, &cont.nonce, cont.iterations)?;
 
     // Normalize(password):
     let password = options.password.as_deref().unwrap_or_default();
@@ -171,6 +181,32 @@ pub(crate) async fn authenticate(
     Ok(())
 }
 
+// Validate the SCRAM server-first message before doing any PBKDF2 work.
+//
+// RFC 5802 describes the server nonce as the client nonce followed by
+// server-chosen characters; a server that replays the client nonce, shortens
+// it, or otherwise drops the client-nonce prefix is rejected. The iteration
+// count is bounded so a hostile server cannot force unbounded work.
+fn validate_server_first_message(
+    client_nonce: &str,
+    server_nonce: &str,
+    iterations: u32,
+) -> Result<(), Error> {
+    if !server_nonce.starts_with(client_nonce) || server_nonce.len() <= client_nonce.len() {
+        return Err(err_protocol!(
+            "server nonce does not contain the client nonce"
+        ));
+    }
+
+    if iterations > MAX_SCRAM_ITERATION_COUNT {
+        return Err(err_protocol!(
+            "server iteration count ({iterations}) exceeds the maximum of {MAX_SCRAM_ITERATION_COUNT}"
+        ));
+    }
+
+    Ok(())
+}
+
 // nonce is a sequence of random printable bytes
 fn gen_nonce() -> String {
     let mut rng = rand::rng();
@@ -194,7 +230,7 @@ fn gen_nonce() -> String {
         .map(|c| c as char)
         .collect();
 
-    format!("{NONCE_ATTR}={nonce}")
+    nonce
 }
 
 // Hi(str, salt, i):
@@ -222,4 +258,45 @@ async fn hi<'a>(s: &'a str, salt: &'a [u8], iter_count: u32) -> Result<[u8; 32],
     }
 
     Ok(hi.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression tests for transact-rs/sqlx#4451: the SCRAM-SHA-256 client
+    // must bound the server iteration count and must verify that the server
+    // nonce extends the client nonce (RFC 5802).
+
+    #[test]
+    fn rejects_unbounded_iteration_count() {
+        // i=u32::MAX from a hostile server must not be accepted.
+        assert!(
+            validate_server_first_message("clientnonce", "clientnonceSERVER", u32::MAX).is_err()
+        );
+    }
+
+    #[test]
+    fn iteration_count_boundary() {
+        // 100,000 matches `postgres-protocol`'s MAX_ITERATION_COUNT precedent.
+        assert!(validate_server_first_message("c", "cS", 100_000).is_ok());
+        assert!(validate_server_first_message("c", "cS", 100_001).is_err());
+    }
+
+    #[test]
+    fn rejects_server_nonce_without_client_prefix() {
+        assert!(validate_server_first_message("clientnonce", "attacker-chosen", 4096).is_err());
+    }
+
+    #[test]
+    fn rejects_server_nonce_replaying_client_nonce() {
+        // RFC 5802: the server must append its own characters; a bare replay
+        // of the client nonce is not acceptable.
+        assert!(validate_server_first_message("clientnonce", "clientnonce", 4096).is_err());
+    }
+
+    #[test]
+    fn accepts_valid_server_first_message() {
+        assert!(validate_server_first_message("clientnonce", "clientnonceSERVER", 4096).is_ok());
+    }
 }
